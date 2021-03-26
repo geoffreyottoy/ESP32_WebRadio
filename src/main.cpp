@@ -5,58 +5,22 @@
 /////////////////////////////////////////////////////////////////
 
 #include <Arduino.h>
-
-#include <VS1053.h>  //https://github.com/baldram/ESP_VS1053_Library
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <esp_wifi.h>
+#include <VUMeter.h>
+#include <WebPlayer.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
-
-
-#define NR_STATIONS 2
-
-#define VS1053_CS   32 
-#define VS1053_DCS  33  
-#define VS1053_DREQ 35 
-#define VS1053_SCK  18
-#define VS1053_MOSI 23
-#define VS1053_MISO 19
 
 #define BTN_NEXT    12
 #define BTN_PREV    13
 
-#define VOLUME  60 // volume level 0-100
-
-TaskHandle_t PlayerLoop_th;
-TaskHandle_t Task2;
-
-int radioStation = 0;
+TaskHandle_t Player_th;
+TaskHandle_t WebUI_th;
+TaskHandle_t VUMeter_th;
 
 char ssid[] = "Techtile";            //  your network SSID (name) 
 char pass[] = "Techtile229";       // your network password
 
-// Few Radio Stations
-String host[NR_STATIONS] = { "icecast.vrtcdn.be", "icecast.vrtcdn.be" };
-String path[NR_STATIONS] = { "/radio1-high.mp3", "/stubru_bruut-high.mp3" };
-int   port[NR_STATIONS] = { 80, 80 };
-
-WiFiClient client;
-uint8_t mp3buff[32];   // vs1053 likes 32 bytes at a time
-
-VS1053 player(VS1053_CS, VS1053_DCS, VS1053_DREQ);
-
-bool changeStation = false;
-
-// LED pins
-const int led1 = 2;
-const int led2 = 4;
-
-bool connectToStation( int station_no );
-void connectToWIFI(bool reconnect);
-void initMP3Decoder();
-
-void drawRadioStationName(int id);
+WebPlayer player(ssid, pass);
 
 void IRAM_ATTR previousButtonInterrupt() {
 
@@ -147,19 +111,12 @@ setInterval(function ( ) {
 </html>
 )rawliteral";
 
-String outputState(){
-  if((radioStation < NR_STATIONS) && (radioStation > -1)){
-    return host[radioStation] ;
-  }
-  return "";
-}
-
 // Replaces placeholder with button section in your web page
 String processor(const String& var){
   //Serial.println(var);
   if(var == "BUTTONPLACEHOLDER"){
     String buttons ="";
-    String outputStateValue = outputState();
+    String outputStateValue = player.getCurrentStation();
     buttons+= "<h4>Output - GPIO 2 - State <span id=\"outputState\"></span></h4><label class=\"switch\"><input type=\"checkbox\" onchange=\"toggleCheckbox(this)\" id=\"output\" " + outputStateValue + "><span class=\"slider\"></span></label>";
     return buttons;
   }
@@ -171,42 +128,32 @@ void PlayerLoop( void * pvParameters ){
   Serial.print("PlayerLoop running on core ");
   Serial.println(xPortGetCoreID());
 
-  initMP3Decoder();
-
-  connectToWIFI(false);
+  player.begin();
 
   while(true){
-    if(changeStation){
-      Serial.println("Changing station...");
-      changeStation = false;
-      client.stop();
-    }
-
-    if(!client.connected()){
-      connectToWIFI(true);
-      connectToStation(radioStation);
-    }
-
-    if(!client.connected()){
-      vTaskDelay(5000);
-    }
-      
-    if(client.available() > 0){
-      uint8_t bytesread = client.read(mp3buff, 32);
-      player.playChunk(mp3buff, bytesread);
-    }
-
-    vTaskDelay(1);
+    player.loop();
+    yield();
   }
 }
 
-//Task2code: blinks an LED every 700 ms
-void Task2code( void * pvParameters ){
-  connectToWIFI(false);
+// VU Meter loop
+void VUMeterLoop( void * pvParameters ){
+  Serial.print("VUMeterLoop running on core ");
+  Serial.println(xPortGetCoreID());
 
-  if(WiFi.status() != WL_CONNECTED){
-    Serial.println("troubles");
-    while(1) vTaskDelay(10);
+  analogSetWidth(9);
+
+  while(true){
+    vuMeter.loop();
+    yield();
+  }
+}
+
+//WebUIcode: blinks an LED every 700 ms
+void WebUILoop( void * pvParameters ){
+  while (WiFi.status() != WL_CONNECTED) {
+    vTaskDelay(500);
+    Serial.print(".");
   }
 
   // Print ESP Local IP Address
@@ -225,8 +172,7 @@ void Task2code( void * pvParameters ){
     if (request->hasParam(PARAM_INPUT_1)) {
       inputMessage = request->getParam(PARAM_INPUT_1)->value();
       inputParam = PARAM_INPUT_1;
-      radioStation = inputMessage.toInt();
-      changeStation = true;
+      player.setStation(inputMessage.toInt());
     }
     else {
       inputMessage = "No message sent";
@@ -238,6 +184,8 @@ void Task2code( void * pvParameters ){
 
   // Send a GET request to <ESP_IP>/state
   server.on("/state", HTTP_GET, [] (AsyncWebServerRequest *request) {
+    int radioStation;
+    player.getCurrentStation(&radioStation);
     request->send(200, "text/plain", String(radioStation).c_str());
   });
 
@@ -252,7 +200,6 @@ void Task2code( void * pvParameters ){
 
 void setup() {
   Serial.begin(115200); 
-  SPI.begin(VS1053_SCK, VS1053_MISO, VS1053_MOSI);
 
   pinMode(BTN_NEXT, INPUT_PULLUP);
   pinMode(BTN_PREV, INPUT_PULLUP);
@@ -260,90 +207,45 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(BTN_PREV), previousButtonInterrupt, FALLING);
   attachInterrupt(digitalPinToInterrupt(BTN_NEXT), nextButtonInterrupt, FALLING);
 
-  //create a task that will be executed in the Task1code() function, with priority 1 and executed on core 0
+  WiFi.begin(ssid, pass);
+
+  //create a task that will be executed in the PlayerLoop() function, with priority 5 and executed on core 0
   xTaskCreatePinnedToCore(
                     PlayerLoop,     /* Task function. */
                     "PlayerLoop",   /* name of task. */
                     10000,          /* Stack size of task */
                     NULL,           /* parameter of the task */
                     5,              /* priority of the task */
-                    &PlayerLoop_th, /* Task handle to keep track of created task */
+                    &Player_th, /* Task handle to keep track of created task */
                     0);             /* pin task to core 0 */                  
   delay(500); 
 
-  //create a task that will be executed in the Task2code() function, with priority 1 and executed on core 1
+  //create a task that will be executed in the VUMeterLoop() function, with priority 3 and executed on core 1
   xTaskCreatePinnedToCore(
-                    Task2code,   /* Task function. */
-                    "Task2",     /* name of task. */
+                    VUMeterLoop,   /* Task function. */
+                    "VUMeter",     /* name of task. */
+                    10000,       /* Stack size of task */
+                    NULL,        /* parameter of the task */
+                    3,           /* priority of the task */
+                    &VUMeter_th,   /* Task handle to keep track of created task */
+                    1);          /* pin task to core 1 */
+  delay(500); 
+
+  //create a task that will be executed in the Task2code() function, with priority 2 and executed on core 1
+  xTaskCreatePinnedToCore(
+                    WebUILoop,   /* Task function. */
+                    "WebUI",     /* name of task. */
                     10000,       /* Stack size of task */
                     NULL,        /* parameter of the task */
                     2,           /* priority of the task */
-                    &Task2,      /* Task handle to keep track of created task */
+                    &WebUI_th,      /* Task handle to keep track of created task */
                     1);          /* pin task to core 1 */
-    delay(500); 
+  delay(500); 
 }
+
 
 void loop() {
+  // delete loop task (because we don't use it)
   vTaskDelete(NULL);
-}
-
-bool connectToStation (int station_no ) {
-  if(station_no > NR_STATIONS || station_no < 0){
-    return false;
-  }
-
-  if(WiFi.status() != WL_CONNECTED){
-    return false;
-  }
-
-  char currentHost[64];
-  host[station_no].toCharArray(currentHost, 64);
-  if(client.connect(currentHost, port[station_no])){
-    Serial.println("Connected now"); 
-    client.print(String("GET ") + path[station_no] + " HTTP/1.1\r\n" +
-              "Host: " + host[station_no] + "\r\n" + 
-              "Connection: close\r\n\r\n");
-    return true;
-  }
-
-  return false;
-}
-
-void connectToWIFI(bool reconnect){
-  if(reconnect){
-    if(WiFi.status() != WL_CONNECTED){
-      WiFi.reconnect();
-    }
-  }
-  else{
-    WiFi.begin(ssid, pass);
-  }
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println("WiFi connected");
-}
-
-void initMP3Decoder()
-{
-  player.begin();
-  player.switchToMp3Mode(); // optional, some boards require this
-  player.setVolume(VOLUME);
-  if(player.isChipConnected()){
-    Serial.println("Connected to codec");
-  }
-  else{
-    Serial.println("Could not connect to codec");
-  }
-}
-
-
-void drawRadioStationName(int id)
-{
-  String command;
-
 }
 
